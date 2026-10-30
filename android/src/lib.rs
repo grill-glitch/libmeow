@@ -694,3 +694,91 @@ pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeSetHomeDir(
         meow_common::home_dir::set_home_dir(std::path::PathBuf::from(dir));
     }
 }
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `Libmeow.nativeProxyDelay(name, url, timeoutMs, expected)` — run meow's
+/// real URL-test probe (dial the proxy, HTTP GET, status check) and return
+/// `{"delay":N}` or `{"error":"..."}`.
+#[no_mangle]
+pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeProxyDelay(
+    mut env: JNIEnv,
+    _class: JClass,
+    name: JString,
+    url: JString,
+    timeout_ms: jint,
+    expected: JString,
+) -> jstring {
+    let name: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(e) => return json_string(&mut env, &format!("{{\"error\":\"{}\"}}", json_escape(&e.to_string()))),
+    };
+    let url: String = match env.get_string(&url) {
+        Ok(s) => s.into(),
+        Err(e) => return json_string(&mut env, &format!("{{\"error\":\"{}\"}}", json_escape(&e.to_string()))),
+    };
+    let expected: String = env
+        .get_string(&expected)
+        .map(|s| s.into())
+        .unwrap_or_default();
+
+    let state = {
+        let guard = ENGINE.lock().unwrap();
+        guard
+            .as_ref()
+            .map(|state| (state.tunnel.clone(), state.rt.handle().clone()))
+    };
+    let Some((tunnel, handle)) = state else {
+        return json_string(&mut env, "{\"error\":\"engine is not running\"}");
+    };
+    let Some(proxy) = tunnel.proxy(&name) else {
+        return json_string(
+            &mut env,
+            &format!("{{\"error\":\"unknown proxy: {}\"}}", json_escape(&name)),
+        );
+    };
+    let timeout = Duration::from_millis(if timeout_ms <= 0 {
+        5000
+    } else {
+        timeout_ms as u64
+    });
+    let expected = if expected.trim().is_empty() {
+        None
+    } else {
+        Some(expected)
+    };
+    let result = handle.block_on(async move {
+        meow_proxy::health::probe_and_record(&proxy, &url, expected.as_deref(), timeout).await
+    });
+    let payload = match result {
+        Ok(delay) => format!("{{\"delay\":{delay}}}"),
+        Err(err) => {
+            let message = match err {
+                meow_proxy::health::UrlTestError::Timeout => "timeout".to_string(),
+                meow_proxy::health::UrlTestError::Transport(message) => message,
+            };
+            format!("{{\"error\":\"{}\"}}", json_escape(&message))
+        }
+    };
+    json_string(&mut env, &payload)
+}
+
+fn json_string(env: &mut JNIEnv, value: &str) -> jstring {
+    env.new_string(value)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}

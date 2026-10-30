@@ -19,8 +19,8 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 ipnet = "2"
 
 meow-common = { path = "../third_party/meow-rs/crates/meow-common" }
-meow-config = { path = "../third_party/meow-rs/crates/meow-config", default-features = false }
+meow-config = { path = "../third_party/meow-rs/crates/meow-config" }
 meow-dns = { path = "../third_party/meow-rs/crates/meow-dns", default-features = false }
 meow-tunnel = { path = "../third_party/meow-rs/crates/meow-tunnel" }
-meow-proxy = { path = "../third_party/meow-rs/crates/meow-proxy", default-features = false }
+meow-proxy = { path = "../third_party/meow-rs/crates/meow-proxy" }
 meow-listener = { path = "../third_party/meow-rs/crates/meow-listener", default-features = false, features = ["listener-tun"] }
