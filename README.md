@@ -59,6 +59,13 @@ rustup target add aarch64-linux-android --toolchain 1.95.0
 BoringSSL, and the NDK's default `libc++_shared.so` is not packaged by the
 app.
 
+## Verified
+
+Built and run on alioth (Android 16, arm64): the VpnService fd is adopted by
+meow's TUN listener, DNS resolves through fake-IP, `adb shell curl
+http://example.com/` returns 200 through the tunnel, and stop removes the
+interface. Details: AsteriskMEOW/meow-poc/VERIFICATION.md.
+
 ## License
 
 MIT. meow-rs is MIT; `meow-lwip` vendors the madeye lwIP fork

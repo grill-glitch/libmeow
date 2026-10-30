@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use jni::objects::{JClass, JObject, JString};
-use jni::sys::{jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
-use jni::{JNIEnv, JavaVM};
+use jni::sys::{jboolean, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
+use jni::JNIEnv;
 
 use meow_listener::{TunListener, TunListenerConfig, TunReady, TunRouteScope};
 use meow_tunnel::Tunnel;
