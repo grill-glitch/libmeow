@@ -10,6 +10,7 @@ API yet; it exposes only what the PoC app needs:
 ```java
 Libmeow.nativeInit();
 Libmeow.nativeSetProtector(vpnService);          // VpnService.protect(fd)
+Libmeow.nativeSetOwnerResolver(vpnService);      // flow uid/package
 Libmeow.nativeStart(configPath, tunFd, mtu);     // engine + TUN
 Libmeow.nativeStop();
 Libmeow.nativeIsRunning();
@@ -63,8 +64,10 @@ app.
 
 Built and run on alioth (Android 16, arm64): the VpnService fd is adopted by
 meow's TUN listener, DNS resolves through fake-IP, `adb shell curl
-http://example.com/` returns 200 through the tunnel, and stop removes the
-interface. Details: AsteriskMEOW/meow-poc/VERIFICATION.md.
+http://example.com/` returns 200 through the tunnel, `UID` rules match via
+`getConnectionOwnerUid`, a SOCKS5 proxy carries traffic with no DIRECT
+fallback, and stop removes the interface. Details:
+AsteriskMEOW/meow-poc/VERIFICATION.md.
 
 ## License
 

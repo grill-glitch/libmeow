@@ -102,6 +102,11 @@ fn start_engine(config_path: &str, fd: i32, mtu: u16) -> Result<EngineState, Str
         .map_err(|e| format!("tokio runtime: {e}"))?;
 
     let built = rt.block_on(async {
+        // UID / PROCESS-NAME rules are dead on Android unless the inbound
+        // declares that it fills the owner fields; the TUN listener does via
+        // the inbound-owner hook installed by nativeSetOwnerResolver.
+        meow_common::process_lookup::enable_inbound_process_info();
+
         let config = meow_config::load_config(config_path)
             .await
             .map_err(|e| format!("load config {config_path}: {e:#}"))?;
@@ -347,6 +352,28 @@ pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeClearProtector(
     meow_common::clear_socket_protector();
 }
 
+/// `Libmeow.nativeSetOwnerResolver(service: VpnService)` — per-flow
+/// `ConnectivityManager.getConnectionOwnerUid` lookup for UID/PROCESS-NAME
+/// rules.
+#[no_mangle]
+pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeSetOwnerResolver(
+    mut env: JNIEnv,
+    _class: JClass,
+    service: JObject,
+) {
+    #[cfg(target_os = "android")]
+    {
+        match owner::install(&mut env, service) {
+            Ok(()) => log::info!("getConnectionOwnerUid hook installed"),
+            Err(e) => set_error(format!("install owner hook: {e}")),
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (&mut env, service);
+    }
+}
+
 #[cfg(target_os = "android")]
 mod protect {
     use std::io;
@@ -393,6 +420,120 @@ mod protect {
             .new_global_ref(service)
             .map_err(|e| format!("global ref: {e}"))?;
         meow_common::set_socket_protector(Arc::new(VpnProtector { vm, service }));
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "android")]
+mod owner {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use jni::objects::{GlobalRef, JObject, JString, JValue};
+    use jni::{JNIEnv, JavaVM};
+
+    use meow_common::inbound_owner::{InboundOwner, InboundOwnerResolver};
+    use meow_common::Network;
+
+    pub struct AndroidOwner {
+        vm: JavaVM,
+        connectivity: GlobalRef,
+        package_manager: GlobalRef,
+    }
+
+    impl InboundOwnerResolver for AndroidOwner {
+        fn lookup(
+            &self,
+            network: Network,
+            local: SocketAddr,
+            remote: SocketAddr,
+        ) -> Option<InboundOwner> {
+            let mut env = self.vm.attach_current_thread().ok()?;
+            let l = socket_addr(&mut env, local).ok()?;
+            let r = socket_addr(&mut env, remote).ok()?;
+            let protocol = if network == Network::Tcp { 6 } else { 17 };
+            let uid = env
+                .call_method(
+                    self.connectivity.as_obj(),
+                    "getConnectionOwnerUid",
+                    "(ILjava/net/InetSocketAddress;Ljava/net/InetSocketAddress;)I",
+                    &[JValue::Int(protocol), JValue::Object(&l), JValue::Object(&r)],
+                )
+                .ok()?
+                .i()
+                .ok()?;
+            if uid < 0 {
+                return None;
+            }
+            let name = env
+                .call_method(
+                    self.package_manager.as_obj(),
+                    "getNameForUid",
+                    "(I)Ljava/lang/String;",
+                    &[JValue::Int(uid)],
+                )
+                .ok()?
+                .l()
+                .ok()?;
+            let package = if name.is_null() {
+                String::new()
+            } else {
+                let js = JString::from(name);
+                env.get_string(&js).map(String::from).unwrap_or_default()
+            };
+            Some(InboundOwner {
+                uid: uid as u32,
+                package,
+            })
+        }
+    }
+
+    fn socket_addr<'a>(
+        env: &mut JNIEnv<'a>,
+        addr: SocketAddr,
+    ) -> jni::errors::Result<JObject<'a>> {
+        let host = env.new_string(addr.ip().to_string())?;
+        env.new_object(
+            "java/net/InetSocketAddress",
+            "(Ljava/lang/String;I)V",
+            &[JValue::Object(&host), JValue::Int(i32::from(addr.port()))],
+        )
+    }
+
+    pub fn install(env: &mut JNIEnv, service: JObject) -> Result<(), String> {
+        let vm = env.get_java_vm().map_err(|e| e.to_string())?;
+        let connectivity_name = env
+            .new_string("connectivity")
+            .map_err(|e| e.to_string())?;
+        let connectivity = env
+            .call_method(
+                &service,
+                "getSystemService",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+                &[JValue::Object(&connectivity_name)],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| format!("getSystemService: {e}"))?;
+        let package_manager = env
+            .call_method(
+                &service,
+                "getPackageManager",
+                "()Landroid/content/pm/PackageManager;",
+                &[],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| format!("getPackageManager: {e}"))?;
+        let connectivity = env
+            .new_global_ref(connectivity)
+            .map_err(|e| e.to_string())?;
+        let package_manager = env
+            .new_global_ref(package_manager)
+            .map_err(|e| e.to_string())?;
+        meow_common::inbound_owner::set_inbound_owner_resolver(Arc::new(AndroidOwner {
+            vm,
+            connectivity,
+            package_manager,
+        }));
         Ok(())
     }
 }

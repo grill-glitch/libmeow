@@ -10,6 +10,18 @@ index 96e2b3c..6f35532 100644
      }
  }
  
+diff --git a/crates/meow-common/src/lib.rs b/crates/meow-common/src/lib.rs
+index d06fc7b..ce989ec 100644
+--- a/crates/meow-common/src/lib.rs
++++ b/crates/meow-common/src/lib.rs
+@@ -27,6 +27,7 @@ pub mod dns_mode;
+ pub mod error;
+ pub mod fs_util;
+ pub mod home_dir;
++pub mod inbound_owner;
+ pub mod logbook;
+ pub mod metadata;
+ pub mod network;
 diff --git a/crates/meow-listener/Cargo.toml b/crates/meow-listener/Cargo.toml
 index 69a42e7..05e3ec0 100644
 --- a/crates/meow-listener/Cargo.toml
@@ -36,7 +48,7 @@ index 69a42e7..05e3ec0 100644
  # Helper (`tun/windows_device.rs`) so they come up Preferred, not tentative.
  [target.'cfg(target_os = "windows")'.dependencies]
 diff --git a/crates/meow-listener/src/tun/mod.rs b/crates/meow-listener/src/tun/mod.rs
-index 4570c1a..f6098cf 100644
+index 4570c1a..2682c07 100644
 --- a/crates/meow-listener/src/tun/mod.rs
 +++ b/crates/meow-listener/src/tun/mod.rs
 @@ -228,6 +228,12 @@ pub struct TunListenerConfig {
@@ -94,6 +106,28 @@ index 4570c1a..f6098cf 100644
  
          let tun_create_ms = t0.elapsed().as_secs_f64() * 1000.0;
          info!("TUN device '{dev_name}' created in {tun_create_ms:.0}ms");
+@@ -1190,7 +1213,7 @@ async fn handle_tcp_flow(
+     dst: SocketAddr, // original destination
+     in_name: &str,
+ ) {
+-    let metadata = Metadata {
++    let mut metadata = Metadata {
+         network: Network::Tcp,
+         conn_type: ConnType::Tun,
+         src_ip: Some(src.ip()),
+@@ -1200,6 +1223,12 @@ async fn handle_tcp_flow(
+         in_name: in_name.into(),
+         ..Default::default()
+     };
++    if let Some(owner) = meow_common::inbound_owner::inbound_owner_resolver()
++        .and_then(|r| r.lookup(Network::Tcp, src, dst))
++    {
++        metadata.uid = Some(owner.uid);
++        metadata.process = owner.package.into();
++    }
+ 
+     // handle_tcp does the rest: name sniff for an unmapped fake IP,
+     // fake-IP rewrite, lazy rule match, stats guard, dial, zero-alloc
 diff --git a/crates/meow-listener/src/tun/outbound_binding.rs b/crates/meow-listener/src/tun/outbound_binding.rs
 index 8a77210..156af4f 100644
 --- a/crates/meow-listener/src/tun/outbound_binding.rs
@@ -156,6 +190,23 @@ index 4527161..afef682 100644
  /// Detect the physical interface carrying the IPv4 default route, for
  /// global route scope's outbound-socket binding (#375).
  ///
+diff --git a/crates/meow-listener/src/tun/udp.rs b/crates/meow-listener/src/tun/udp.rs
+index b00860f..3e13c01 100644
+--- a/crates/meow-listener/src/tun/udp.rs
++++ b/crates/meow-listener/src/tun/udp.rs
+@@ -333,6 +333,12 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
+         in_name: in_name.into(),
+         ..Default::default()
+     };
++    if let Some(owner) = meow_common::inbound_owner::inbound_owner_resolver()
++        .and_then(|r| r.lookup(Network::Udp, src, dst))
++    {
++        metadata.uid = Some(owner.uid);
++        metadata.process = owner.package.into();
++    }
+ 
+     let inner = tunnel.inner();
+     if matches!(
 diff --git a/crates/meow-lwip/old-src/custom/arch/cc_others.h b/crates/meow-lwip/old-src/custom/arch/cc_others.h
 index 379142f..cec3b22 100644
 --- a/crates/meow-lwip/old-src/custom/arch/cc_others.h
