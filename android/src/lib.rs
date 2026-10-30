@@ -40,6 +40,33 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+mod cli;
+
+/// CLI entry point for the ROOT/TUN launcher. The launcher `dlopen`s the
+/// same `libmeow.so` used by JNI and calls this without a JVM.
+#[no_mangle]
+pub extern "C" fn meow_cli_main(argc: libc::c_int, argv: *const *const libc::c_char) -> libc::c_int {
+    let mut args = Vec::new();
+    if !argv.is_null() {
+        for index in 0..argc.max(0) as usize {
+            let pointer = unsafe { *argv.add(index) };
+            if pointer.is_null() {
+                continue;
+            }
+            let text = unsafe { std::ffi::CStr::from_ptr(pointer) };
+            args.push(text.to_string_lossy().into_owned());
+        }
+    }
+    let cli_args = if args.is_empty() { &args[..] } else { &args[1..] };
+    match cli::run_cli(cli_args) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("meow-core: {error}");
+            1
+        }
+    }
+}
+
 const VERSION: &str = concat!("libmeow ", env!("CARGO_PKG_VERSION"), " (meow-rs 0.28.0)");
 const TUN_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const TUN_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);

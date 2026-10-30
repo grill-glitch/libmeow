@@ -1773,6 +1773,7 @@ dependencies = [
  "android_logger",
  "ipnet",
  "jni 0.21.1",
+ "libc",
  "log",
  "meow-common",
  "meow-config",
@@ -1782,6 +1783,7 @@ dependencies = [
  "meow-tunnel",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1840,22 +1842,6 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
-]
-
-[[package]]
-name = "meow-core"
-version = "0.1.0"
-dependencies = [
- "libc",
- "meow-common",
- "meow-config",
- "meow-dns",
- "meow-listener",
- "meow-tunnel",
- "serde_yaml",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

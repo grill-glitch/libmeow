@@ -24,15 +24,8 @@ const RULE_PREF_CORE: &str = "100";
 const RULE_PREF_TUN: &str = "200";
 const TUN_TABLE: &str = "2022";
 
-fn main() {
-    if let Err(error) = run() {
-        eprintln!("meow-core: {error}");
-        std::process::exit(1);
-    }
-}
-
-fn run() -> Result<(), String> {
-    let args = Args::parse()?;
+pub(crate) fn run_cli(argv: &[String]) -> Result<(), String> {
+    let args = Args::parse(argv)?;
     let doc = std::fs::read_to_string(&args.config)
         .map_err(|e| format!("read {}: {e}", args.config.display()))?;
     let (yaml, tun) = reshape(&doc)?;
@@ -60,10 +53,10 @@ struct Args {
 }
 
 impl Args {
-    fn parse() -> Result<Self, String> {
+    fn parse(argv: &[String]) -> Result<Self, String> {
         let mut workdir = PathBuf::from(".");
         let mut config = None;
-        let mut it = std::env::args().skip(1);
+        let mut it = argv.iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "-d" => workdir = PathBuf::from(it.next().ok_or("missing -d value")?),

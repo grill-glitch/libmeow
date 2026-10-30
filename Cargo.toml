@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["android", "core"]
+members = ["android"]
 exclude = ["third_party/meow-rs"]
 
 [profile.release]
