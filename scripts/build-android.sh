@@ -10,9 +10,19 @@ set -euo pipefail
 ABI="${1:-arm64-v8a}"
 PROFILE="${2:-release}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-NDK="${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/30.0.16248370}"
-SDK_CMAKE="${SDK_CMAKE:-$HOME/Android/Sdk/cmake/3.22.1/bin/cmake}"
+if [ -n "${ANDROID_NDK_HOME:-}" ]; then
+  NDK="$ANDROID_NDK_HOME"
+elif [ -n "${ANDROID_NDK_ROOT:-}" ]; then
+  NDK="$ANDROID_NDK_ROOT"
+else
+  NDK="$(ls -d "$HOME/Android/Sdk/ndk/"* 2>/dev/null | sort -V | tail -1)"
+fi
+[ -d "$NDK" ] || { echo "Android NDK not found; set ANDROID_NDK_HOME" >&2; exit 2; }
+if [ -z "${SDK_CMAKE:-}" ]; then
+  SDK_CMAKE="$(ls -d "$HOME/Android/Sdk/cmake/"*/bin/cmake 2>/dev/null | sort -V | tail -1)"
+fi
 MIN_SDK="${MIN_SDK:-26}"
+SYNC_JNILIBS="${SYNC_JNILIBS:-}"
 
 case "$ABI" in
   arm64-v8a) TRIPLE=aarch64-linux-android; CMAKE_ABI=arm64-v8a ;;
@@ -33,7 +43,9 @@ EOF
 
 export ANDROID_NDK_HOME="$NDK"
 export BORING_BSSL_RUST_CPPLIB=c++_static
-[ -x "$SDK_CMAKE" ] && export CMAKE="$SDK_CMAKE"
+if [ -n "$SDK_CMAKE" ] && [ -x "$SDK_CMAKE" ]; then
+  export CMAKE="$SDK_CMAKE"
+fi
 # cargo-ndk does not read rust-android-gradle's link-arg variable; force
 # 16 KB ELF segment alignment through rustc instead.
 export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-z,max-page-size=16384"
@@ -56,3 +68,8 @@ else
     cargo ndk -t "$ABI" -P "$MIN_SDK" -o "$ROOT/build/jniLibs" build --release -p meow-android
 fi
 ls -lh "$ROOT/build/jniLibs/$ABI/libmeow.so"
+if [ -n "$SYNC_JNILIBS" ]; then
+  mkdir -p "$SYNC_JNILIBS/$ABI"
+  cp "$ROOT/build/jniLibs/$ABI/libmeow.so" "$SYNC_JNILIBS/$ABI/libmeow.so"
+  sha256sum "$SYNC_JNILIBS/$ABI/libmeow.so"
+fi

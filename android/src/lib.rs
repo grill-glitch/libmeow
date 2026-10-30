@@ -18,6 +18,28 @@ use jni::JNIEnv;
 use meow_listener::{TunListener, TunListenerConfig, TunReady, TunRouteScope};
 use meow_tunnel::Tunnel;
 
+macro_rules! jni_guard {
+    ($default:expr, $body:block) => {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+            Ok(value) => value,
+            Err(_) => {
+                log::error!("panic caught at JNI boundary");
+                $default
+            }
+        }
+    };
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
 const VERSION: &str = concat!("libmeow ", env!("CARGO_PKG_VERSION"), " (meow-rs 0.28.0)");
 const TUN_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const TUN_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,10 +57,18 @@ static ENGINE: Mutex<Option<EngineState>> = Mutex::new(None);
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
 static LOGGER: OnceLock<()> = OnceLock::new();
 
+fn lock_engine() -> std::sync::MutexGuard<'static, Option<EngineState>> {
+    ENGINE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_error() -> std::sync::MutexGuard<'static, String> {
+    LAST_ERROR.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn set_error(msg: impl Into<String>) {
     let msg = msg.into();
     log::error!("{msg}");
-    *LAST_ERROR.lock().unwrap() = msg;
+    *lock_error() = msg;
 }
 
 fn init_logging() {
@@ -71,7 +101,13 @@ fn init_logging() {
     });
 }
 
-fn stop_engine(mut state: EngineState) {
+fn stop_engine(state: EngineState) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stop_engine_inner(state))).is_err() {
+        log::error!("panic while stopping engine");
+    }
+}
+
+fn stop_engine_inner(mut state: EngineState) {
     if let Some(task) = state.tun_task.take() {
         task.abort();
         let _ = state.rt.block_on(async { task.await });
@@ -95,6 +131,19 @@ fn stop_engine(mut state: EngineState) {
 }
 
 fn start_engine(config_path: &str, fd: i32, mtu: u16) -> Result<EngineState, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        start_engine_inner(config_path, fd, mtu)
+    })) {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = format!("panic while starting engine: {}", panic_message(payload));
+            log::error!("{message}");
+            Err(message)
+        }
+    }
+}
+
+fn start_engine_inner(config_path: &str, fd: i32, mtu: u16) -> Result<EngineState, String> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -236,7 +285,7 @@ pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeStart(
     }
     let mtu = if mtu <= 0 { 1500 } else { mtu as u16 };
 
-    let mut guard = ENGINE.lock().unwrap();
+    let mut guard = lock_engine();
     if let Some(old) = guard.take() {
         stop_engine(old);
     }
@@ -259,7 +308,7 @@ pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeStop(
     _env: JNIEnv,
     _class: JClass,
 ) {
-    let state = ENGINE.lock().unwrap().take();
+    let state = lock_engine().take();
     if let Some(state) = state {
         stop_engine(state);
         log::info!("engine stopped");
@@ -272,7 +321,7 @@ pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeIsRunning(
     _env: JNIEnv,
     _class: JClass,
 ) -> jboolean {
-    if ENGINE.lock().unwrap().is_some() {
+    if lock_engine().is_some() {
         JNI_TRUE
     } else {
         JNI_FALSE
@@ -280,7 +329,7 @@ pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeIsRunning(
 }
 
 fn traffic() -> (i64, i64) {
-    let guard = ENGINE.lock().unwrap();
+    let guard = lock_engine();
     match guard.as_ref() {
         Some(state) => {
             let (up, down) = state.tunnel.statistics().snapshot();
@@ -314,7 +363,7 @@ pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeLastError(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let msg = LAST_ERROR.lock().unwrap().clone();
+    let msg = lock_error().clone();
     env.new_string(msg)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
@@ -695,6 +744,131 @@ pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeSetHomeDir(
     }
 }
 
+
+#[derive(serde::Serialize)]
+struct ConnectionsPayload {
+    #[serde(rename = "uploadTotal")]
+    upload_total: i64,
+    #[serde(rename = "downloadTotal")]
+    download_total: i64,
+    memory: u64,
+    connections: Vec<meow_tunnel::statistics::ConnectionInfo>,
+}
+
+/// Resident set size of the app process. `/proc/self/status` reports kB
+/// independent of the device page size (4 KB or 16 KB).
+fn rss_bytes() -> u64 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            if let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok()) {
+                return kb.saturating_mul(1024);
+            }
+        }
+    }
+    0
+}
+
+/// `Libmeow.nativeMemoryUsage(): Long` — process RSS in bytes.
+#[no_mangle]
+pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeMemoryUsage(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    rss_bytes() as jlong
+}
+
+/// `Libmeow.nativeConnectionCount(): Int`
+#[no_mangle]
+pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeConnectionCount(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    jni_guard!(0, {
+        lock_engine()
+            .as_ref()
+            .map(|state| state.tunnel.statistics().active_connection_count() as jint)
+            .unwrap_or(0)
+    })
+}
+
+/// `Libmeow.nativeConnectionsJson(): String` — mihomo `/connections` shape.
+#[no_mangle]
+pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeConnectionsJson(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    jni_guard!(std::ptr::null_mut(), {
+        let payload = {
+            let guard = lock_engine();
+            match guard.as_ref() {
+                Some(state) => {
+                    let stats = state.tunnel.statistics();
+                    let (up, down) = stats.snapshot();
+                    ConnectionsPayload {
+                        upload_total: up as i64,
+                        download_total: down as i64,
+                        memory: rss_bytes(),
+                        connections: stats.active_connections(),
+                    }
+                }
+                None => ConnectionsPayload {
+                    upload_total: 0,
+                    download_total: 0,
+                    memory: rss_bytes(),
+                    connections: Vec::new(),
+                },
+            }
+        };
+        match serde_json::to_string(&payload) {
+            Ok(json) => json_string(&mut env, &json),
+            Err(error) => {
+                log::error!("serialize connections: {error}");
+                json_string(&mut env, "{\"uploadTotal\":0,\"downloadTotal\":0,\"memory\":0,\"connections\":[]}")
+            }
+        }
+    })
+}
+
+/// `Libmeow.nativeCloseConnection(id): Boolean`
+#[no_mangle]
+pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeCloseConnection(
+    mut env: JNIEnv,
+    _class: JClass,
+    id: JString,
+) -> jboolean {
+    jni_guard!(JNI_FALSE, {
+        let Ok(id) = env.get_string(&id) else {
+            return JNI_FALSE;
+        };
+        let id: String = id.into();
+        let Ok(id) = uuid::Uuid::parse_str(&id) else {
+            return JNI_FALSE;
+        };
+        let Some(state) = lock_engine().as_ref().map(|state| state.tunnel.clone()) else {
+            return JNI_FALSE;
+        };
+        state.statistics().close_connection(id);
+        JNI_TRUE
+    })
+}
+
+/// `Libmeow.nativeCloseAllConnections()`
+#[no_mangle]
+pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeCloseAllConnections(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    jni_guard!((), {
+        if let Some(state) = lock_engine().as_ref() {
+            state.tunnel.statistics().close_all_connections();
+        }
+    })
+}
+
+
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for ch in s.chars() {
@@ -737,7 +911,7 @@ pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeProxyDelay(
         .unwrap_or_default();
 
     let state = {
-        let guard = ENGINE.lock().unwrap();
+        let guard = lock_engine();
         guard
             .as_ref()
             .map(|state| (state.tunnel.clone(), state.rt.handle().clone()))
@@ -761,16 +935,23 @@ pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeProxyDelay(
     } else {
         Some(expected)
     };
-    let result = handle.block_on(async move {
-        meow_proxy::health::probe_and_record(&proxy, &url, expected.as_deref(), timeout).await
-    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle.block_on(async move {
+            meow_proxy::health::probe_and_record(&proxy, &url, expected.as_deref(), timeout).await
+        })
+    }));
     let payload = match result {
-        Ok(delay) => format!("{{\"delay\":{delay}}}"),
-        Err(err) => {
+        Ok(Ok(delay)) => format!("{{\"delay\":{delay}}}"),
+        Ok(Err(err)) => {
             let message = match err {
                 meow_proxy::health::UrlTestError::Timeout => "timeout".to_string(),
                 meow_proxy::health::UrlTestError::Transport(message) => message,
             };
+            format!("{{\"error\":\"{}\"}}", json_escape(&message))
+        }
+        Err(payload) => {
+            let message = format!("panic in delay probe: {}", panic_message(payload));
+            log::error!("{message}");
             format!("{{\"error\":\"{}\"}}", json_escape(&message))
         }
     };
