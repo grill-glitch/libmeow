@@ -13,6 +13,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashMap;
+use meow_api::ApiServer;
 use meow_listener::{TunListener, TunListenerConfig, TunReady, TunRouteScope};
 use meow_tunnel::Tunnel;
 use tokio::net::TcpListener;
@@ -184,7 +186,7 @@ fn first_string(value: &Value) -> Option<String> {
 async fn run_engine(args: &Args, tun: &TunSpec) -> Result<(), String> {
     meow_common::home_dir::set_home_dir(args.workdir.clone());
     meow_common::process_lookup::enable_inbound_process_info();
-    let config = meow_config::load_config(
+    let mut config = meow_config::load_config(
         args.workdir.join("config.meow-core.yaml").to_string_lossy().as_ref(),
     )
     .await
@@ -199,10 +201,66 @@ async fn run_engine(args: &Args, tun: &TunSpec) -> Result<(), String> {
         ));
     }
 
+    let api_addr = config.api.external_controller;
+    let api_secret = config.api.secret.clone();
+    let api_external_ui = config.api.external_ui.clone();
+    let raw_config = Arc::new(parking_lot::RwLock::new(config.raw.clone()));
+    let proxy_providers: Arc<DashMap<String, Arc<meow_config::proxy_provider::ProxyProvider>>> = {
+        let map = DashMap::new();
+        for (name, provider) in std::mem::take(&mut config.proxy_providers) {
+            map.insert(name, provider);
+        }
+        Arc::new(map)
+    };
+    let rule_providers = Arc::new(parking_lot::RwLock::new(std::mem::take(
+        &mut config.rule_providers,
+    )));
+    let listeners = config.listeners.named.clone();
+    let health_specs = meow_config::extract_health_check_specs(
+        config.raw.proxy_groups.as_deref().unwrap_or(&[]),
+    );
+
     let tunnel = Tunnel::new_with_slot(config.dns.resolver_slot.clone());
     tunnel.set_mode(config.general.mode);
     tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
     tunnel.spawn_background_tasks();
+    tunnel.reconcile_health_checks(&health_specs);
+
+    if let Some(addr) = api_addr {
+        let (log_tx, _) = tokio::sync::broadcast::channel(1024);
+        let rule_provider_refresh =
+            Arc::new(meow_config::rule_provider_refresh::RefreshSupervisor::default());
+        rule_provider_refresh.reconcile(&rule_providers);
+        let proxy_provider_refresh =
+            Arc::new(meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor::default());
+        proxy_provider_refresh.reconcile(&proxy_providers, config.raw.proxy_providers.as_ref());
+        let dns_server = Arc::new(parking_lot::RwLock::new(None));
+        let api = ApiServer::new(
+            tunnel.clone(),
+            addr,
+            api_secret,
+            Some(args.config.to_string_lossy().into_owned()),
+            raw_config,
+            log_tx,
+            proxy_providers,
+            rule_providers,
+            rule_provider_refresh,
+            proxy_provider_refresh,
+            listeners,
+            api_external_ui,
+            dns_server,
+            config.provider_dialer_registry.clone(),
+        );
+        let socket = TcpListener::bind(addr)
+            .await
+            .map_err(|e| format!("bind external-controller {addr}: {e}"))?;
+        eprintln!("meow-core: API listening on {addr}");
+        tokio::spawn(async move {
+            if let Err(error) = api.run_on(socket).await {
+                eprintln!("meow-core: API server error: {error}");
+            }
+        });
+    }
 
     // TUN2SOCKS mode: asteriskd's hev-socks5-tunnel owns the TUN device and
     // routes; the meow core only serves the SOCKS port declared by the
