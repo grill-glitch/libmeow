@@ -537,3 +537,160 @@ mod owner {
         Ok(())
     }
 }
+
+#[cfg(target_os = "android")]
+mod protect_iface {
+    use std::io;
+    use std::sync::Arc;
+
+    use jni::objects::{GlobalRef, JObject, JValue};
+    use jni::{JNIEnv, JavaVM};
+
+    use meow_common::SocketProtector;
+
+    pub struct TunProtector {
+        vm: JavaVM,
+        iface: GlobalRef,
+    }
+
+    impl SocketProtector for TunProtector {
+        fn protect(&self, fd: std::os::fd::RawFd) -> io::Result<()> {
+            let mut env = self
+                .vm
+                .attach_current_thread()
+                .map_err(|e| io::Error::other(format!("attach to JVM: {e}")))?;
+            env.call_method(
+                self.iface.as_obj(),
+                "markSocket",
+                "(I)V",
+                &[JValue::Int(fd)],
+            )
+            .map_err(|e| io::Error::other(format!("TunInterface.markSocket: {e}")))?;
+            Ok(())
+        }
+    }
+
+    pub fn install(env: &mut JNIEnv, iface: JObject) -> Result<(), String> {
+        let vm = env.get_java_vm().map_err(|e| e.to_string())?;
+        let iface = env
+            .new_global_ref(iface)
+            .map_err(|e| format!("global ref: {e}"))?;
+        meow_common::set_socket_protector(Arc::new(TunProtector { vm, iface }));
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "android")]
+mod owner_iface {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use jni::objects::{GlobalRef, JObject, JValue};
+    use jni::{JNIEnv, JavaVM};
+
+    use meow_common::inbound_owner::{InboundOwner, InboundOwnerResolver};
+    use meow_common::Network;
+
+    pub struct TunOwner {
+        vm: JavaVM,
+        iface: GlobalRef,
+    }
+
+    impl InboundOwnerResolver for TunOwner {
+        fn lookup(
+            &self,
+            network: Network,
+            local: SocketAddr,
+            remote: SocketAddr,
+        ) -> Option<InboundOwner> {
+            let mut env = self.vm.attach_current_thread().ok()?;
+            let l = env.new_string(local.to_string()).ok()?;
+            let r = env.new_string(remote.to_string()).ok()?;
+            let protocol = if network == Network::Tcp { 6 } else { 17 };
+            let uid = env
+                .call_method(
+                    self.iface.as_obj(),
+                    "querySocketUid",
+                    "(ILjava/lang/String;Ljava/lang/String;)I",
+                    &[JValue::Int(protocol), JValue::Object(&l), JValue::Object(&r)],
+                )
+                .ok()?
+                .i()
+                .ok()?;
+            if uid < 0 {
+                None
+            } else {
+                Some(InboundOwner {
+                    uid: uid as u32,
+                    package: String::new(),
+                })
+            }
+        }
+    }
+
+    pub fn install(env: &mut JNIEnv, iface: JObject) -> Result<(), String> {
+        let vm = env.get_java_vm().map_err(|e| e.to_string())?;
+        let iface = env
+            .new_global_ref(iface)
+            .map_err(|e| format!("global ref: {e}"))?;
+        meow_common::inbound_owner::set_inbound_owner_resolver(Arc::new(TunOwner { vm, iface }));
+        Ok(())
+    }
+}
+
+/// `Libmeow.nativeSetProtectorCallback(TunInterface)` — call `markSocket(fd)`
+/// before every outbound connect/bind, matching mihomo's `TunInterface`.
+#[no_mangle]
+pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeSetProtectorCallback(
+    mut env: JNIEnv,
+    _class: JClass,
+    iface: JObject,
+) {
+    #[cfg(target_os = "android")]
+    {
+        match protect_iface::install(&mut env, iface) {
+            Ok(()) => log::info!("TunInterface.markSocket hook installed"),
+            Err(e) => set_error(format!("install TunInterface protector: {e}")),
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (&mut env, iface);
+    }
+}
+
+/// `Libmeow.nativeSetOwnerCallback(TunInterface)` — call
+/// `querySocketUid(protocol, src, dst)` per flow.
+#[no_mangle]
+pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeSetOwnerCallback(
+    mut env: JNIEnv,
+    _class: JClass,
+    iface: JObject,
+) {
+    #[cfg(target_os = "android")]
+    {
+        match owner_iface::install(&mut env, iface) {
+            Ok(()) => log::info!("TunInterface.querySocketUid hook installed"),
+            Err(e) => set_error(format!("install TunInterface owner: {e}")),
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (&mut env, iface);
+    }
+}
+
+/// `Libmeow.nativeSetHomeDir(dir)` — meow's resource home (`Country.mmdb`,
+/// `geosite.dat`, provider caches). Must be called before the first config
+/// load; the app's `files/clash` directory is writable.
+#[no_mangle]
+pub extern "system" fn Java_org_asterisk_meow_Libmeow_nativeSetHomeDir(
+    mut env: JNIEnv,
+    _class: JClass,
+    dir: JString,
+) {
+    if let Ok(dir) = env.get_string(&dir) {
+        let dir: String = dir.into();
+        meow_common::home_dir::set_home_dir(std::path::PathBuf::from(dir));
+    }
+}
