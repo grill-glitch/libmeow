@@ -28,4 +28,4 @@ meow-config = { path = "../third_party/meow-rs/crates/meow-config" }
 meow-dns = { path = "../third_party/meow-rs/crates/meow-dns", default-features = false }
 meow-tunnel = { path = "../third_party/meow-rs/crates/meow-tunnel" }
 meow-proxy = { path = "../third_party/meow-rs/crates/meow-proxy" }
-meow-listener = { path = "../third_party/meow-rs/crates/meow-listener", default-features = false, features = ["listener-tun"] }
+meow-listener = { path = "../third_party/meow-rs/crates/meow-listener", default-features = false, features = ["listener-tun", "listener-socks5"] }

@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use meow_listener::{TunListener, TunListenerConfig, TunReady, TunRouteScope};
 use meow_tunnel::Tunnel;
+use tokio::net::TcpListener;
 use serde_yaml::{Mapping, Value};
 
 const TUNSETIFF: libc::Ioctl = 0x4004_54ca;
@@ -134,7 +135,6 @@ fn reshape(source: &str) -> Result<(String, TunSpec), String> {
         );
     }
     map.insert(Value::String("tun".into()), Value::Mapping(tun));
-    map.insert(Value::String("log-level".into()), Value::String("debug".into()));
 
     // meow's resolver rejects the literal `system`; META uses it for the
     // bootstrap nameserver.
@@ -199,14 +199,47 @@ async fn run_engine(args: &Args, tun: &TunSpec) -> Result<(), String> {
         ));
     }
 
-    let fd = create_tun(&tun.device)?;
-    configure_interface(&tun.device, &tun.inet4, tun.mtu)?;
-    let rules = PolicyRoutes::install(&tun.device)?;
-
     let tunnel = Tunnel::new_with_slot(config.dns.resolver_slot.clone());
     tunnel.set_mode(config.general.mode);
     tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
     tunnel.spawn_background_tasks();
+
+    // TUN2SOCKS mode: asteriskd's hev-socks5-tunnel owns the TUN device and
+    // routes; the meow core only serves the SOCKS port declared by the
+    // profile.
+    if let Some(port) = config.listeners.socks_port {
+        let auth = config.auth.clone();
+        let bind = if config.listeners.bind_address == "*" {
+            "0.0.0.0".to_string()
+        } else {
+            config.listeners.bind_address.clone()
+        };
+        let listener = TcpListener::bind((bind.as_str(), port))
+            .await
+            .map_err(|e| format!("bind socks {bind}:{port}: {e}"))?;
+        eprintln!("meow-core: SOCKS5 listening on {bind}:{port}");
+        loop {
+            let (stream, peer) = listener.accept().await.map_err(|e| format!("accept: {e}"))?;
+            let tunnel = tunnel.clone();
+            let auth = auth.clone();
+            tokio::spawn(async move {
+                meow_listener::socks5::handle_socks5(
+                    &tunnel,
+                    stream,
+                    peer,
+                    None,
+                    Some(auth.as_ref()),
+                    "socks",
+                    port,
+                )
+                .await;
+            });
+        }
+    }
+
+    let fd = create_tun(&tun.device)?;
+    configure_interface(&tun.device, &tun.inet4, tun.mtu)?;
+    let rules = PolicyRoutes::install(&tun.device)?;
 
     let cfg = TunListenerConfig {
         device: Some(tun.device.clone()),
