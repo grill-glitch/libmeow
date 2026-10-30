@@ -1,0 +1,23 @@
+[package]
+name = "meow-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ROOT/TUN core process for AsteriskMEOW (meow-rs)."
+
+[[bin]]
+name = "meow-core"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+meow-common = { path = "../third_party/meow-rs/crates/meow-common" }
+meow-config = { path = "../third_party/meow-rs/crates/meow-config" }
+meow-dns = { path = "../third_party/meow-rs/crates/meow-dns" }
+meow-tunnel = { path = "../third_party/meow-rs/crates/meow-tunnel" }
+meow-listener = { path = "../third_party/meow-rs/crates/meow-listener", default-features = false, features = ["listener-tun"] }

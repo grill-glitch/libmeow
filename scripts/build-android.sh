@@ -9,6 +9,9 @@ set -euo pipefail
 
 ABI="${1:-arm64-v8a}"
 PROFILE="${2:-release}"
+PACKAGE="${PACKAGE:-meow-android}"
+BIN_ARGS="${BIN_ARGS:-}"
+ARTIFACT="${ARTIFACT:-libmeow.so}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if [ -n "${ANDROID_NDK_HOME:-}" ]; then
   NDK="$ANDROID_NDK_HOME"
@@ -62,12 +65,12 @@ BINDGEN_ENV_UNDERSCORE="BINDGEN_EXTRA_CLANG_ARGS_${TRIPLE//-/_}=$CLANG_ARGS"
 cd "$ROOT"
 if [ "$PROFILE" = "debug" ]; then
   env "$TOOLCHAIN_ENV" "$BINDGEN_ENV" "$BINDGEN_ENV_TARGET" "$BINDGEN_ENV_UNDERSCORE" \
-    cargo ndk -t "$ABI" -P "$MIN_SDK" -o "$ROOT/build/jniLibs" build -p meow-android
+    cargo ndk -t "$ABI" -P "$MIN_SDK" -o "$ROOT/build/jniLibs" build $BIN_ARGS -p "$PACKAGE"
 else
   env "$TOOLCHAIN_ENV" "$BINDGEN_ENV" "$BINDGEN_ENV_TARGET" "$BINDGEN_ENV_UNDERSCORE" \
-    cargo ndk -t "$ABI" -P "$MIN_SDK" -o "$ROOT/build/jniLibs" build --release -p meow-android
+    cargo ndk -t "$ABI" -P "$MIN_SDK" -o "$ROOT/build/jniLibs" build --release $BIN_ARGS -p "$PACKAGE"
 fi
-ls -lh "$ROOT/build/jniLibs/$ABI/libmeow.so"
+ls -lh "$ROOT/build/jniLibs/$ABI/$ARTIFACT" 2>/dev/null || true
 if [ -n "$SYNC_JNILIBS" ]; then
   mkdir -p "$SYNC_JNILIBS/$ABI"
   cp "$ROOT/build/jniLibs/$ABI/libmeow.so" "$SYNC_JNILIBS/$ABI/libmeow.so"
