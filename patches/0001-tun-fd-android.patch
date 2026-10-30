@@ -1,0 +1,171 @@
+diff --git a/crates/meow-api/src/lib.rs b/crates/meow-api/src/lib.rs
+index 96e2b3c..6f35532 100644
+--- a/crates/meow-api/src/lib.rs
++++ b/crates/meow-api/src/lib.rs
+@@ -63,6 +63,7 @@ pub fn tun_config_to_listener_config(
+         dns_hijack: tun.dns_hijack,
+         udp_timeout: tun.udp_timeout,
+         max_connections: tun.max_connections,
++        fd: None,
+     }
+ }
+ 
+diff --git a/crates/meow-listener/Cargo.toml b/crates/meow-listener/Cargo.toml
+index 69a42e7..05e3ec0 100644
+--- a/crates/meow-listener/Cargo.toml
++++ b/crates/meow-listener/Cargo.toml
+@@ -53,7 +53,6 @@ smol_str = { workspace = true }
+ tun-rs = { workspace = true, optional = true }
+ lwip = { workspace = true, optional = true }
+ futures = { workspace = true, optional = true }
+-route_manager = { workspace = true, optional = true }
+ meow-dns = { workspace = true, optional = true }
+ ipnet = { workspace = true, optional = true }
+ # listener-shadowsocks
+@@ -73,6 +72,12 @@ async-trait = { workspace = true }
+ tracing-subscriber = { workspace = true }
+ smol_str = { workspace = true }
+ 
++# listener-tun: global route installation. Not built on Android: the
++# VpnService builder owns the device's routes, and route_manager has no
++# Android backend.
++[target.'cfg(not(target_os = "android"))'.dependencies]
++route_manager = { workspace = true, optional = true }
++
+ # listener-tun: the Wintun adapter's addresses are assigned through IP
+ # Helper (`tun/windows_device.rs`) so they come up Preferred, not tentative.
+ [target.'cfg(target_os = "windows")'.dependencies]
+diff --git a/crates/meow-listener/src/tun/mod.rs b/crates/meow-listener/src/tun/mod.rs
+index 4570c1a..f6098cf 100644
+--- a/crates/meow-listener/src/tun/mod.rs
++++ b/crates/meow-listener/src/tun/mod.rs
+@@ -228,6 +228,12 @@ pub struct TunListenerConfig {
+     /// Cap on concurrent TUN TCP handler tasks. Inherited from the
+     /// top-level `max-connections` key (default 256; `0` = unlimited).
+     pub max_connections: usize,
++    /// Pre-opened TUN device descriptor (Android `VpnService.Builder`,
++    /// or a root-created device). When `Some`, the listener adopts this fd
++    /// with `tun_rs::AsyncDevice::from_fd` instead of creating a device;
++    /// the embedder owns the address/route/DNS setup. Ownership of the fd
++    /// transfers to the listener, which closes it on teardown.
++    pub fd: Option<i32>,
+ }
+ 
+ /// Which routes `auto_route` installs (#375; see the module docs).
+@@ -453,7 +459,22 @@ impl TunListener {
+         let mut last_err: Option<String>;
+         let mut if_index: Option<u32> = None;
+ 
+-        for attempt in 0..MAX_TUN_RETRIES {
++        if let Some(fd) = cfg.fd {
++            let d = unsafe { tun_rs::AsyncDevice::from_fd(fd) }
++                .map_err(|e| io::Error::other(format!("adopt TUN fd {fd}: {e}")))?;
++            // AsyncDevice on Android exposes neither if_index() nor name();
++            // the VpnService owns the interface and routes, and this path
++            // installs none.
++            dev_name = cfg.device.clone().unwrap_or_else(|| "tun".into());
++            device = Some(d);
++        } else {
++            #[cfg(target_os = "android")]
++            return Err(Box::new(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "tun listener on Android needs a pre-opened fd (VpnService.Builder.establish())",
++            )));
++            #[cfg(not(target_os = "android"))]
++            for attempt in 0..MAX_TUN_RETRIES {
+             let name = device_name_for_attempt(cfg.device.as_deref(), attempt);
+ 
+             // Rotate the addresses after the first retry fails
+@@ -569,12 +590,14 @@ impl TunListener {
+             // cleanup they exist to wait for. Bounded by TUN_STARTUP_TIMEOUT
+             // (issue #641).
+             tokio::time::sleep(TUN_CREATE_RETRY_DELAY).await;
++            }
+         }
+         // SAFETY: the loop either breaks with `device = Some(...)` and
+-        // `dev_name` set, or returns `Err` above.
++        // `dev_name` set, or returns `Err` above. An adopted fd may not
++        // expose an interface index; 0 is safe because no routes are
++        // installed on that path.
+         let device = device.unwrap();
+-        // SAFETY: set on the same break that sets `device`.
+-        let if_index = if_index.unwrap();
++        let if_index = if_index.unwrap_or(0);
+ 
+         let tun_create_ms = t0.elapsed().as_secs_f64() * 1000.0;
+         info!("TUN device '{dev_name}' created in {tun_create_ms:.0}ms");
+diff --git a/crates/meow-listener/src/tun/outbound_binding.rs b/crates/meow-listener/src/tun/outbound_binding.rs
+index 8a77210..156af4f 100644
+--- a/crates/meow-listener/src/tun/outbound_binding.rs
++++ b/crates/meow-listener/src/tun/outbound_binding.rs
+@@ -170,6 +170,7 @@ mod tests {
+                 dns_hijack: false,
+                 udp_timeout: std::time::Duration::from_secs(60),
+                 max_connections: 0,
++                fd: None,
+             },
+             "meow-tun-test".into(),
+         )
+diff --git a/crates/meow-listener/src/tun/route.rs b/crates/meow-listener/src/tun/route.rs
+index 4527161..afef682 100644
+--- a/crates/meow-listener/src/tun/route.rs
++++ b/crates/meow-listener/src/tun/route.rs
+@@ -9,14 +9,17 @@
+ //! case some platforms report "route exists").
+ 
+ use ipnet::IpNet;
++#[cfg(not(target_os = "android"))]
+ use route_manager::{Route, RouteManager};
+ use tracing::{debug, warn};
+ 
++#[cfg(not(target_os = "android"))]
+ pub(super) struct RouteGuard {
+     manager: RouteManager,
+     installed: Vec<Route>,
+ }
+ 
++#[cfg(not(target_os = "android"))]
+ impl RouteGuard {
+     /// Install one on-link route per net through interface `if_index`.
+     /// Individual failures are logged and skipped so a pre-existing
+@@ -41,6 +44,7 @@ impl RouteGuard {
+     }
+ }
+ 
++#[cfg(not(target_os = "android"))]
+ impl Drop for RouteGuard {
+     fn drop(&mut self) {
+         for route in &self.installed {
+@@ -51,6 +55,19 @@ impl Drop for RouteGuard {
+     }
+ }
+ 
++/// Android has no `route_manager` backend, and the VpnService builder owns
++/// the device's routes: `auto-route` is a no-op and the embedder installs
++/// routes before handing over the fd.
++#[cfg(target_os = "android")]
++pub(super) struct RouteGuard;
++
++#[cfg(target_os = "android")]
++impl RouteGuard {
++    pub(super) fn setup(_if_index: u32, _nets: &[IpNet]) -> std::io::Result<Self> {
++        Ok(Self)
++    }
++}
++
+ /// Detect the physical interface carrying the IPv4 default route, for
+ /// global route scope's outbound-socket binding (#375).
+ ///
+diff --git a/crates/meow-lwip/old-src/custom/arch/cc_others.h b/crates/meow-lwip/old-src/custom/arch/cc_others.h
+index 379142f..cec3b22 100644
+--- a/crates/meow-lwip/old-src/custom/arch/cc_others.h
++++ b/crates/meow-lwip/old-src/custom/arch/cc_others.h
+@@ -54,7 +54,7 @@
+ 
+ #define LWIP_ERRNO_INCLUDE <errno.h>
+ 
+-#if defined(LWIP_UNIX_LINUX) || defined(LWIP_UNIX_HURD)
++#if defined(LWIP_UNIX_LINUX) || defined(LWIP_UNIX_HURD) || defined(LWIP_UNIX_ANDROID)
+ #define LWIP_ERRNO_STDINCLUDE	1
+ #endif
+ 
